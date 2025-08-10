@@ -289,7 +289,7 @@ jobs:
           
       - name: Download Plan
         if: matrix.environment == 'production'
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: tfplan-${{ matrix.environment }}
           path: terraform/${{ matrix.environment }}
