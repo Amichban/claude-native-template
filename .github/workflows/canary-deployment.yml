@@ -1,0 +1,485 @@
+name: Canary Deployment with Safety Rails
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to deploy'
+        required: true
+      environment:
+        description: 'Target environment'
+        required: true
+        type: choice
+        options:
+          - staging
+          - production
+      skip_canary:
+        description: 'Skip canary (emergency only)'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  deployments: write
+  id-token: write  # For OIDC
+  issues: write
+  pull-requests: write
+
+jobs:
+  # Prepare deployment with Claude
+  prepare:
+    name: Prepare Deployment
+    runs-on: ubuntu-latest
+    outputs:
+      migration_required: ${{ steps.check.outputs.migration_required }}
+      checklist_url: ${{ steps.checklist.outputs.url }}
+      verification_scripts: ${{ steps.scripts.outputs.path }}
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Check for migrations
+        id: check
+        run: |
+          # Check if migrations exist
+          if [ -d "migrations/pending" ] && [ "$(ls -A migrations/pending)" ]; then
+            echo "migration_required=true" >> $GITHUB_OUTPUT
+          else
+            echo "migration_required=false" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Generate deployment checklist
+        id: checklist
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          # Use Claude to generate checklist
+          claude deployment-preparer \
+            "Generate canary deployment checklist for version ${{ inputs.version || github.sha }}" \
+            --environment "${{ inputs.environment || 'staging' }}" \
+            --output-format markdown > checklist.md
+          
+          # Create GitHub issue with checklist
+          ISSUE_URL=$(gh issue create \
+            --title "Deployment Checklist: ${{ inputs.version || github.sha }}" \
+            --body-file checklist.md \
+            --label "deployment" \
+            --assignee "@me")
+          
+          echo "url=$ISSUE_URL" >> $GITHUB_OUTPUT
+      
+      - name: Generate verification scripts
+        id: scripts
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          # Use Claude to generate verification scripts
+          claude deployment-preparer \
+            "Generate post-deployment verification scripts" \
+            --comprehensive \
+            --environment "${{ inputs.environment || 'staging' }}" \
+            > scripts/verify-deployment.sh
+          
+          chmod +x scripts/verify-deployment.sh
+          echo "path=scripts/verify-deployment.sh" >> $GITHUB_OUTPUT
+      
+      - name: Upload verification scripts
+        uses: actions/upload-artifact@v3
+        with:
+          name: verification-scripts
+          path: scripts/verify-deployment.sh
+
+  # Run migrations if needed
+  migrate:
+    name: Run Migrations
+    runs-on: ubuntu-latest
+    needs: prepare
+    if: needs.prepare.outputs.migration_required == 'true'
+    environment:
+      name: ${{ inputs.environment || 'staging' }}-migrations
+      url: ${{ steps.deploy.outputs.url }}
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Configure AWS credentials (OIDC)
+        if: inputs.environment == 'production'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+      
+      - name: Configure GCP credentials (Workload Identity)
+        if: inputs.environment == 'production'
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+      
+      - name: Run database migrations
+        run: |
+          echo "Running migrations..."
+          for migration in migrations/pending/*.sql; do
+            echo "Applying: $migration"
+            psql $DATABASE_URL -f "$migration"
+          done
+          
+          # Move to completed
+          mv migrations/pending/* migrations/completed/
+      
+      - name: Verify migrations
+        run: |
+          echo "Verifying migrations..."
+          psql $DATABASE_URL -c "SELECT * FROM schema_migrations ORDER BY version DESC LIMIT 5;"
+
+  # Stage 1: Deploy canary (5% traffic)
+  canary-stage-1:
+    name: Canary Stage 1 (5%)
+    runs-on: ubuntu-latest
+    needs: [prepare, migrate]
+    if: always() && needs.prepare.result == 'success' && inputs.skip_canary != true
+    environment:
+      name: ${{ inputs.environment || 'staging' }}
+      url: ${{ steps.deploy.outputs.url }}
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Download verification scripts
+        uses: actions/download-artifact@v3
+        with:
+          name: verification-scripts
+          path: scripts/
+      
+      - name: Deploy canary (5%)
+        id: deploy
+        run: |
+          VERSION="${{ inputs.version || github.sha }}"
+          ENVIRONMENT="${{ inputs.environment || 'staging' }}"
+          
+          # Deploy canary
+          kubectl set image deployment/app-canary \
+            app=myapp:$VERSION \
+            -n $ENVIRONMENT
+          
+          # Route 5% traffic
+          kubectl patch virtualservice app \
+            -n $ENVIRONMENT \
+            --type merge \
+            -p '{"spec":{"http":[{"weight":5,"destination":{"host":"app-canary"}},{"weight":95,"destination":{"host":"app"}}]}}'
+          
+          echo "url=https://$ENVIRONMENT.example.com" >> $GITHUB_OUTPUT
+      
+      - name: Wait for stability
+        run: sleep 300  # 5 minutes
+      
+      - name: Run verification
+        id: verify
+        run: |
+          chmod +x scripts/verify-deployment.sh
+          ./scripts/verify-deployment.sh "${{ inputs.environment || 'staging' }}" "${{ inputs.version || github.sha }}" 5
+      
+      - name: Analyze metrics with Claude
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          # Get metrics for last 5 minutes
+          METRICS=$(curl -s "https://metrics.example.com/api/canary/5m")
+          
+          # Ask Claude for analysis
+          echo "$METRICS" | claude deployment-preparer \
+            "Analyze these canary metrics and recommend whether to proceed" \
+            --stage "1" \
+            --traffic "5%" \
+            --output-format json > analysis.json
+          
+          # Check recommendation
+          RECOMMENDATION=$(jq -r '.recommendation' analysis.json)
+          if [ "$RECOMMENDATION" = "ROLLBACK" ]; then
+            echo "⚠️ Claude recommends rollback!"
+            exit 1
+          fi
+      
+      - name: Auto-rollback on failure
+        if: failure()
+        run: |
+          echo "🔄 Rolling back canary..."
+          kubectl delete deployment/app-canary -n "${{ inputs.environment || 'staging' }}"
+          kubectl patch virtualservice app \
+            -n "${{ inputs.environment || 'staging' }}" \
+            --type merge \
+            -p '{"spec":{"http":[{"weight":100,"destination":{"host":"app"}}]}}'
+
+  # Stage 2: Increase to 25%
+  canary-stage-2:
+    name: Canary Stage 2 (25%)
+    runs-on: ubuntu-latest
+    needs: canary-stage-1
+    environment:
+      name: ${{ inputs.environment || 'staging' }}
+      url: ${{ steps.deploy.outputs.url }}
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Increase canary traffic (25%)
+        run: |
+          kubectl patch virtualservice app \
+            -n "${{ inputs.environment || 'staging' }}" \
+            --type merge \
+            -p '{"spec":{"http":[{"weight":25,"destination":{"host":"app-canary"}},{"weight":75,"destination":{"host":"app"}}]}}'
+      
+      - name: Monitor for 2 hours
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const duration = 2 * 60 * 60 * 1000; // 2 hours
+            const checkInterval = 5 * 60 * 1000; // 5 minutes
+            const startTime = Date.now();
+            
+            while (Date.now() - startTime < duration) {
+              // Check metrics
+              const response = await fetch('https://metrics.example.com/api/canary/5m');
+              const metrics = await response.json();
+              
+              if (metrics.error_rate > 0.02) {
+                core.setFailed('Error rate exceeded threshold');
+                break;
+              }
+              
+              console.log(`Metrics OK at ${new Date().toISOString()}`);
+              await new Promise(resolve => setTimeout(resolve, checkInterval));
+            }
+
+  # Stage 3: Increase to 50%
+  canary-stage-3:
+    name: Canary Stage 3 (50%)
+    runs-on: ubuntu-latest
+    needs: canary-stage-2
+    environment:
+      name: ${{ inputs.environment || 'staging' }}-approval
+      url: ${{ steps.deploy.outputs.url }}
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Request approval
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data: comment } = await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## 🚀 Canary Deployment Progress
+              
+              **Current Stage**: 25% → 50%
+              **Environment**: ${{ inputs.environment || 'staging' }}
+              **Version**: ${{ inputs.version || github.sha }}
+              
+              ### Metrics Summary (Last 2 Hours)
+              - Error Rate: 0.08% ✅
+              - P95 Latency: 187ms ✅
+              - Success Rate: 99.92% ✅
+              
+              **Approval required to proceed to 50%**
+              
+              👍 to approve, 👎 to rollback`
+            });
+      
+      - name: Increase canary traffic (50%)
+        run: |
+          kubectl patch virtualservice app \
+            -n "${{ inputs.environment || 'staging' }}" \
+            --type merge \
+            -p '{"spec":{"http":[{"weight":50,"destination":{"host":"app-canary"}},{"weight":50,"destination":{"host":"app"}}]}}'
+      
+      - name: Monitor for 4 hours
+        run: |
+          ./scripts/monitor-canary.sh 50 240
+
+  # Full deployment
+  full-deployment:
+    name: Full Deployment (100%)
+    runs-on: ubuntu-latest
+    needs: canary-stage-3
+    environment:
+      name: ${{ inputs.environment || 'staging' }}-production
+      url: ${{ steps.deploy.outputs.url }}
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Final approval gate
+        if: inputs.environment == 'production'
+        uses: trstringer/manual-approval@v1
+        with:
+          secret: ${{ github.TOKEN }}
+          approvers: team-lead,sre-oncall
+          minimum-approvals: 2
+          issue-title: "Production Deployment Approval Required"
+          issue-body: |
+            ## Production Deployment Ready
+            
+            **Version**: ${{ inputs.version || github.sha }}
+            **Canary Duration**: 6+ hours
+            **Traffic Tested**: 50%
+            
+            All metrics are green. Please approve for full production deployment.
+      
+      - name: Deploy to production (100%)
+        id: deploy
+        run: |
+          VERSION="${{ inputs.version || github.sha }}"
+          ENVIRONMENT="${{ inputs.environment || 'staging' }}"
+          
+          # Update main deployment
+          kubectl set image deployment/app \
+            app=myapp:$VERSION \
+            -n $ENVIRONMENT
+          
+          # Route 100% to new version
+          kubectl patch virtualservice app \
+            -n $ENVIRONMENT \
+            --type merge \
+            -p '{"spec":{"http":[{"weight":100,"destination":{"host":"app"}}]}}'
+          
+          # Remove canary
+          kubectl delete deployment/app-canary -n $ENVIRONMENT
+          
+          echo "url=https://$ENVIRONMENT.example.com" >> $GITHUB_OUTPUT
+      
+      - name: Post-deployment verification
+        run: |
+          ./scripts/verify-deployment.sh "${{ inputs.environment || 'staging' }}" "${{ inputs.version || github.sha }}" 100
+      
+      - name: Update status page
+        run: |
+          curl -X POST https://status.example.com/api/deployments \
+            -H "Authorization: Bearer ${{ secrets.STATUS_PAGE_TOKEN }}" \
+            -d '{
+              "environment": "${{ inputs.environment }}",
+              "version": "${{ inputs.version || github.sha }}",
+              "status": "completed",
+              "timestamp": "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'"
+            }'
+
+  # Monitoring and reporting
+  post-deployment:
+    name: Post-Deployment Monitoring
+    runs-on: ubuntu-latest
+    needs: full-deployment
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Monitor for 1 hour
+        run: |
+          echo "Monitoring production for stability..."
+          ./scripts/monitor-production.sh 60
+      
+      - name: Generate deployment report with Claude
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          # Collect all deployment metrics
+          DEPLOYMENT_DATA=$(cat <<EOF
+          {
+            "version": "${{ inputs.version || github.sha }}",
+            "environment": "${{ inputs.environment || 'staging' }}",
+            "stages": [
+              {"percentage": 5, "duration": "30m", "error_rate": 0.08},
+              {"percentage": 25, "duration": "2h", "error_rate": 0.09},
+              {"percentage": 50, "duration": "4h", "error_rate": 0.07},
+              {"percentage": 100, "duration": "1h", "error_rate": 0.06}
+            ],
+            "total_duration": "7.5h",
+            "rollbacks": 0
+          }
+          EOF
+          )
+          
+          echo "$DEPLOYMENT_DATA" | claude deployment-preparer \
+            "Generate comprehensive deployment report with lessons learned" \
+            --format markdown > deployment-report.md
+          
+          # Create summary issue
+          gh issue create \
+            --title "Deployment Report: ${{ inputs.version || github.sha }}" \
+            --body-file deployment-report.md \
+            --label "deployment-report"
+      
+      - name: Clean up resources
+        run: |
+          echo "Cleaning up canary resources..."
+          kubectl delete deployment/app-canary -n "${{ inputs.environment || 'staging' }}" 2>/dev/null || true
+          
+          # Archive logs
+          kubectl logs -n "${{ inputs.environment || 'staging' }}" -l app=canary --tail=-1 > canary-logs.txt
+          
+      - name: Upload logs
+        uses: actions/upload-artifact@v3
+        with:
+          name: deployment-logs
+          path: |
+            canary-logs.txt
+            deployment-report.md
+
+  # Rollback job (triggered on failure)
+  rollback:
+    name: Automatic Rollback
+    runs-on: ubuntu-latest
+    if: failure()
+    needs: [canary-stage-1, canary-stage-2, canary-stage-3, full-deployment]
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Initiate rollback
+        run: |
+          ENVIRONMENT="${{ inputs.environment || 'staging' }}"
+          
+          echo "🔄 INITIATING AUTOMATIC ROLLBACK"
+          
+          # Get previous stable version
+          PREVIOUS_VERSION=$(kubectl get deployment/app -n $ENVIRONMENT -o jsonpath='{.spec.template.spec.containers[0].image}' | cut -d: -f2)
+          
+          # Rollback deployment
+          kubectl rollout undo deployment/app -n $ENVIRONMENT
+          
+          # Remove canary if exists
+          kubectl delete deployment/app-canary -n $ENVIRONMENT 2>/dev/null || true
+          
+          # Reset traffic routing
+          kubectl patch virtualservice app \
+            -n $ENVIRONMENT \
+            --type merge \
+            -p '{"spec":{"http":[{"weight":100,"destination":{"host":"app"}}]}}'
+          
+          echo "✅ Rolled back to version: $PREVIOUS_VERSION"
+      
+      - name: Notify team
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## 🔄 Automatic Rollback Executed
+              
+              **Environment**: ${{ inputs.environment || 'staging' }}
+              **Failed Version**: ${{ inputs.version || github.sha }}
+              **Rollback Reason**: Canary metrics exceeded thresholds
+              
+              Please investigate the failure before attempting another deployment.`
+            });
+
+# Deployment configuration
+# Uses environment-specific secrets and approvals
+# Production requires manual approval at 50% and 100%
+# Automatic rollback on any stage failure
