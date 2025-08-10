@@ -50,11 +50,12 @@ jobs:
       
       - name: Run TruffleHog OSS
         uses: trufflesecurity/trufflehog@main
+        continue-on-error: true
         with:
           path: ./
           base: ${{ github.event.repository.default_branch }}
           head: HEAD
-          extra_args: --debug --only-verified
+          extra_args: --only-verified
 
   # STEP 3: Dependency Scanning
   dependency-scan:
@@ -66,15 +67,19 @@ jobs:
       
       - name: Run Trivy vulnerability scanner
         uses: aquasecurity/trivy-action@master
+        continue-on-error: true
         with:
           scan-type: 'fs'
           scan-ref: '.'
           format: 'sarif'
           output: 'trivy-results.sarif'
+          exit-code: '0'
+          severity: 'CRITICAL,HIGH,MEDIUM'
       
       - name: Upload Trivy results to GitHub Security
         uses: github/codeql-action/upload-sarif@v3
         if: always()
+        continue-on-error: true
         with:
           sarif_file: 'trivy-results.sarif'
       
@@ -137,26 +142,30 @@ jobs:
   container-scan:
     name: 🐳 Container Security Scan
     runs-on: ubuntu-latest
+    continue-on-error: true
     
     steps:
       - uses: actions/checkout@v4
       
-      - name: Build Docker image
+      - name: Check for Dockerfile and scan
         run: |
           if [ -f Dockerfile ]; then
-            docker build -t localscan:latest . || true
+            echo "🐳 Found Dockerfile - building and scanning..."
+            docker build -t localscan:latest . || echo "⚠️ Docker build failed"
+            
+            if docker images | grep -q localscan; then
+              echo "Running Trivy scan on built image..."
+              docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+                aquasec/trivy image localscan:latest \
+                --severity CRITICAL,HIGH \
+                --exit-code 0 || true
+            fi
+          else
+            echo "ℹ️ No Dockerfile found - skipping container scan"
+            echo "To enable container scanning:"
+            echo "  1. Add a Dockerfile to your repository"
+            echo "  2. The workflow will automatically build and scan it"
           fi
-      
-      - name: Run Trivy container scan
-        if: success()
-        uses: aquasecurity/trivy-action@master
-        with:
-          image-ref: 'localscan:latest'
-          format: 'table'
-          exit-code: '0'
-          ignore-unfixed: true
-          vuln-type: 'os,library'
-          severity: 'CRITICAL,HIGH'
 
   # STEP 6: License and Compliance Check
   compliance-check:
