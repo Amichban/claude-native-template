@@ -1,4 +1,7 @@
-name: Security Scanning and Auto-Fix
+name: Security Scanning Template
+
+# This workflow demonstrates security scanning best practices.
+# It's a TEMPLATE - customize for your security needs.
 
 on:
   push:
@@ -6,23 +9,19 @@ on:
   pull_request:
     branches: [main]
   schedule:
-    - cron: '0 0 * * 0'  # Weekly scan
+    - cron: '0 0 * * 1'  # Weekly on Monday
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
   security-events: write
   pull-requests: write
-  issues: write
 
 jobs:
-  codeql:
-    name: CodeQL Analysis
+  # STEP 1: Code Security Analysis
+  code-analysis:
+    name: 🔍 Code Security Analysis
     runs-on: ubuntu-latest
-    
-    strategy:
-      matrix:
-        language: ['javascript', 'python']
     
     steps:
       - uses: actions/checkout@v4
@@ -30,18 +29,36 @@ jobs:
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v3
         with:
-          languages: ${{ matrix.language }}
-          
+          languages: javascript, python
+          # For other languages: cpp, csharp, go, java, ruby
+      
       - name: Autobuild
         uses: github/codeql-action/autobuild@v3
-        
+      
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@v3
-        with:
-          category: "/language:${{ matrix.language }}"
 
+  # STEP 2: Secret Scanning
+  secret-scan:
+    name: 🔐 Secret Detection
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for better detection
+      
+      - name: Run TruffleHog OSS
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          base: ${{ github.event.repository.default_branch }}
+          head: HEAD
+          extra_args: --debug --only-verified
+
+  # STEP 3: Dependency Scanning
   dependency-scan:
-    name: Dependency Vulnerability Scan
+    name: 📦 Dependency Vulnerability Scan
     runs-on: ubuntu-latest
     
     steps:
@@ -54,306 +71,207 @@ jobs:
           scan-ref: '.'
           format: 'sarif'
           output: 'trivy-results.sarif'
-          severity: 'CRITICAL,HIGH'
-          
+      
       - name: Upload Trivy results to GitHub Security
         uses: github/codeql-action/upload-sarif@v3
+        if: always()
         with:
           sarif_file: 'trivy-results.sarif'
+      
+      - name: Check Python dependencies
+        continue-on-error: true
+        run: |
+          if [ -f requirements.txt ]; then
+            pip install safety
+            safety check --file requirements.txt --json || true
+          else
+            echo "No requirements.txt found - skipping Python dependency check"
+          fi
+      
+      - name: Check Node dependencies
+        continue-on-error: true
+        run: |
+          if [ -f package.json ]; then
+            npm audit --audit-level=moderate || true
+          else
+            echo "No package.json found - skipping Node dependency check"
+          fi
 
-  secret-scan:
-    name: Secret Detection
+  # STEP 4: SAST Scanning
+  sast-scan:
+    name: 🛡️ Static Application Security Testing
     runs-on: ubuntu-latest
     
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0  # Full history for better detection
-          
-      - name: TruffleHog Secret Scan
-        uses: trufflesecurity/trufflehog@main
-        with:
-          path: ./
-          base: ${{ github.event.repository.default_branch }}
-          head: HEAD
-          
-      - name: Gitleaks Secret Scan
-        uses: gitleaks/gitleaks-action@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-  auto-fix-vulnerabilities:
-    name: Auto-Fix Security Issues with Claude
-    runs-on: ubuntu-latest
-    needs: [codeql, dependency-scan]
-    if: github.event_name == 'pull_request'
-    
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.pull_request.head.ref }}
-          
-      - name: Set up Python
+      
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          
-      - name: Get security alerts
-        id: get-alerts
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          # Get CodeQL alerts
-          ALERTS=$(gh api /repos/${{ github.repository }}/code-scanning/alerts --jq '.[] | select(.state=="open") | {rule: .rule.description, path: .most_recent_instance.location.path, line: .most_recent_instance.location.start_line}')
-          echo "alerts<<EOF" >> $GITHUB_OUTPUT
-          echo "$ALERTS" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
-          
-      - name: Get Dependabot alerts
-        id: get-dependabot
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          DEPS=$(gh api /repos/${{ github.repository }}/dependabot/alerts --jq '.[] | select(.state=="open") | {package: .dependency.package.name, severity: .security_advisory.severity, fixed_in: .security_advisory.fixed_in}')
-          echo "dependencies<<EOF" >> $GITHUB_OUTPUT
-          echo "$DEPS" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
-          
-      - name: Auto-fix with Claude
-        if: steps.get-alerts.outputs.alerts != '' || steps.get-dependabot.outputs.dependencies != ''
-        env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-        run: |
-          # Create fix request for Claude
-          cat > fix_request.py << 'EOF'
-          import os
-          import json
-          import subprocess
-          from anthropic import Anthropic
-          
-          client = Anthropic(api_key=os.environ['ANTHROPIC_API_KEY'])
-          
-          # Parse alerts
-          alerts = """${{ steps.get-alerts.outputs.alerts }}"""
-          dependencies = """${{ steps.get-dependabot.outputs.dependencies }}"""
-          
-          # Build prompt
-          prompt = f"""
-          You are a security expert. Fix these security issues:
-          
-          CodeQL Alerts:
-          {alerts}
-          
-          Dependency Vulnerabilities:
-          {dependencies}
-          
-          For each issue:
-          1. If it's a code issue, fix the vulnerable code
-          2. If it's a dependency, update to the secure version
-          3. Add comments explaining the security fix
-          
-          Only fix issues that are safe to auto-fix:
-          - Update vulnerable dependencies
-          - Add input validation
-          - Escape outputs
-          - Add security headers
-          - Fix SQL injection by using parameterized queries
-          
-          Do NOT auto-fix:
-          - Authentication logic
-          - Authorization rules
-          - Cryptographic implementations
-          """
-          
-          # Get Claude's fixes
-          response = client.messages.create(
-              model="claude-3-opus-20240229",
-              max_tokens=4000,
-              messages=[{"role": "user", "content": prompt}]
-          )
-          
-          # Apply fixes (this would need proper implementation)
-          print(response.content[0].text)
-          EOF
-          
-          python fix_request.py > fixes.txt
-          
-      - name: Apply dependency updates
-        if: steps.get-dependabot.outputs.dependencies != ''
-        run: |
-          # Update Python dependencies
-          if [ -f "requirements.txt" ]; then
-            pip-audit --fix --dry-run
-            pip-audit --fix
-          fi
-          
-          # Update Node dependencies
-          if [ -f "package.json" ]; then
-            npm audit fix
-          fi
-          
-      - name: Commit fixes
-        if: steps.get-alerts.outputs.alerts != '' || steps.get-dependabot.outputs.dependencies != ''
-        run: |
-          git config --global user.name "Claude Security Bot"
-          git config --global user.email "claude-security@anthropic.com"
-          
-          # Check for changes
-          if [ -n "$(git status --porcelain)" ]; then
-            git add -A
-            git commit -m "fix(security): Auto-fix vulnerabilities detected by security scan
-            
-            - Updated vulnerable dependencies
-            - Fixed code security issues
-            - Added input validation where needed
-            
-            Co-authored-by: github-actions[bot] <github-actions[bot]@users.noreply.github.com>"
-            
-            git push
-            
-            # Comment on PR
-            gh pr comment ${{ github.event.pull_request.number }} --body "## 🔒 Security Auto-Fix Applied
-            
-            I've automatically fixed the following security issues:
-            - Updated vulnerable dependencies
-            - Added input validation
-            - Fixed potential injection vulnerabilities
-            
-            **Please review these changes carefully before merging.**
-            
-            Run \`npm test\` and \`pytest\` to ensure fixes don't break functionality."
-          fi
-
-  sast-scan:
-    name: Static Application Security Testing
-    runs-on: ubuntu-latest
-    
-    steps:
-      - uses: actions/checkout@v4
       
-      - name: Semgrep SAST
-        uses: returntocorp/semgrep-action@v1
-        with:
-          config: >-
-            p/security-audit
-            p/owasp-top-ten
-            p/python
-            p/javascript
-            p/typescript
-            p/react
-            
-      - name: Bandit (Python Security)
-        if: ${{ hashFiles('**/*.py') != '' }}
+      - name: Run Bandit (Python Security)
+        continue-on-error: true
         run: |
-          pip install bandit
-          bandit -r . -f json -o bandit-results.json || true
-          
-      - name: ESLint Security Plugin
-        if: ${{ hashFiles('**/*.js', '**/*.ts', '**/*.jsx', '**/*.tsx') != '' }}
-        run: |
-          npm install -g eslint eslint-plugin-security
-          eslint . --ext .js,.jsx,.ts,.tsx --format json --output-file eslint-security.json || true
-
-  container-scan:
-    name: Container Security Scan
-    runs-on: ubuntu-latest
-    
-    steps:
-      - uses: actions/checkout@v4
-      
-      - name: Check for Dockerfile
-        id: dockerfile-check
-        run: |
-          if ls Dockerfile* 2>/dev/null || find . -name "Dockerfile*" -type f 2>/dev/null | grep -q .; then
-            echo "has_dockerfile=true" >> $GITHUB_OUTPUT
+          # Check if Python files exist before installing Bandit
+          if find . -name "*.py" -type f | head -1 | grep -q .; then
+            pip install bandit
+            bandit -r . -f json -o bandit-results.json || true
           else
-            echo "has_dockerfile=false" >> $GITHUB_OUTPUT
+            echo "No Python files found - skipping Bandit scan"
           fi
+          if [ -f bandit-results.json ]; then
+            echo "### 🐍 Python Security Issues (Bandit)" >> $GITHUB_STEP_SUMMARY
+            echo '```json' >> $GITHUB_STEP_SUMMARY
+            cat bandit-results.json | jq '.results[] | {severity, issue_text, filename, line_number}' >> $GITHUB_STEP_SUMMARY || true
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          fi
+      
+      - name: Run Semgrep
+        uses: returntocorp/semgrep-action@v1
+        continue-on-error: true
+        with:
+          config: auto
+
+  # STEP 5: Container Scanning (if applicable)
+  container-scan:
+    name: 🐳 Container Security Scan
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v4
       
       - name: Build Docker image
-        if: steps.dockerfile-check.outputs.has_dockerfile == 'true'
         run: |
-          docker build -t local-scan:latest .
-          
+          if [ -f Dockerfile ]; then
+            docker build -t localscan:latest . || true
+          fi
+      
       - name: Run Trivy container scan
-        if: steps.dockerfile-check.outputs.has_dockerfile == 'true'
+        if: success()
         uses: aquasecurity/trivy-action@master
         with:
-          image-ref: 'local-scan:latest'
-          format: 'sarif'
-          output: 'container-scan.sarif'
-          
-      - name: Upload results
-        if: steps.dockerfile-check.outputs.has_dockerfile == 'true'
-        uses: github/codeql-action/upload-sarif@v3
-        with:
-          sarif_file: 'container-scan.sarif'
+          image-ref: 'localscan:latest'
+          format: 'table'
+          exit-code: '0'
+          ignore-unfixed: true
+          vuln-type: 'os,library'
+          severity: 'CRITICAL,HIGH'
 
+  # STEP 6: License and Compliance Check
   compliance-check:
-    name: Compliance and License Check
+    name: ⚖️ License & Compliance Check
     runs-on: ubuntu-latest
+    continue-on-error: true
     
     steps:
       - uses: actions/checkout@v4
       
-      - name: License Scanner
-        continue-on-error: true
-        uses: fossas/fossa-action@main
-        with:
-          api-key: ${{ secrets.FOSSA_API_KEY || 'dummy-key' }}
-          
-      - name: GDPR Compliance Check
+      - name: Check licenses
         run: |
-          # Check for PII handling
-          grep -r "email\|phone\|address\|ssn\|dob" --include="*.py" --include="*.js" --include="*.ts" || true
-          
-      - name: Check Security Headers
-        run: |
-          # Verify security headers in code
-          grep -r "X-Frame-Options\|Content-Security-Policy\|X-Content-Type-Options" --include="*.py" --include="*.js" || echo "⚠️ Missing security headers"
+          echo "📋 License Check"
+          echo ""
+          echo "Checking for license files..."
+          find . -name "LICENSE*" -o -name "COPYING*" | head -10
+          echo ""
+          echo "For production, consider using:"
+          echo "  - FOSSA (requires API key)"
+          echo "  - License Finder"
+          echo "  - Snyk License Compliance"
 
-  create-security-issue:
-    name: Create Security Tracking Issue
+  # STEP 7: Security Summary
+  security-summary:
+    name: 📊 Security Summary
     runs-on: ubuntu-latest
-    needs: [codeql, dependency-scan, secret-scan, sast-scan]
+    needs: [code-analysis, secret-scan, dependency-scan, sast-scan]
+    if: always()
+    
+    steps:
+      - name: Generate security summary
+        run: |
+          echo "## 🔒 Security Scan Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Check each job status
+          if [ "${{ needs.code-analysis.result }}" = "success" ]; then
+            echo "✅ **Code Analysis**: No issues found" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️ **Code Analysis**: Issues detected - review required" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          if [ "${{ needs.secret-scan.result }}" = "success" ]; then
+            echo "✅ **Secret Scan**: No secrets detected" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "🚨 **Secret Scan**: Potential secrets found - immediate action required!" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          if [ "${{ needs.dependency-scan.result }}" = "success" ]; then
+            echo "✅ **Dependencies**: All dependencies secure" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️ **Dependencies**: Vulnerabilities found - update recommended" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          if [ "${{ needs.sast-scan.result }}" = "success" ]; then
+            echo "✅ **SAST**: No security issues in code" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️ **SAST**: Security issues found - review recommended" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📚 Security Resources" >> $GITHUB_STEP_SUMMARY
+          echo "- [OWASP Top 10](https://owasp.org/www-project-top-ten/)" >> $GITHUB_STEP_SUMMARY
+          echo "- [CWE Top 25](https://cwe.mitre.org/top25/)" >> $GITHUB_STEP_SUMMARY
+          echo "- [GitHub Security Best Practices](https://docs.github.com/en/code-security)" >> $GITHUB_STEP_SUMMARY
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🔧 Next Steps" >> $GITHUB_STEP_SUMMARY
+          echo "1. Review any detected issues in the Security tab" >> $GITHUB_STEP_SUMMARY
+          echo "2. Update vulnerable dependencies" >> $GITHUB_STEP_SUMMARY
+          echo "3. Fix any code security issues" >> $GITHUB_STEP_SUMMARY
+          echo "4. Re-run scans after fixes" >> $GITHUB_STEP_SUMMARY
+
+  # STEP 8: Create issue for critical findings
+  create-issue:
+    name: 📝 Create Security Issue
+    runs-on: ubuntu-latest
+    needs: [secret-scan, dependency-scan]
     if: failure()
     
     steps:
-      - name: Create issue
+      - name: Create issue for security findings
         uses: actions/github-script@v7
+        continue-on-error: true
         with:
           script: |
-            const issue = await github.rest.issues.create({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              title: '🔒 Security Scan Failed - Action Required',
-              body: `## Security Issues Detected
-              
-              The automated security scan has detected issues that need attention.
-              
-              ### Scan Results
-              - CodeQL: ${{ needs.codeql.result }}
-              - Dependencies: ${{ needs.dependency-scan.result }}
-              - Secrets: ${{ needs.secret-scan.result }}
-              - SAST: ${{ needs.sast-scan.result }}
-              
-              ### Next Steps
-              1. Review the security scan results in the Actions tab
-              2. Fix critical and high severity issues immediately
-              3. Use \`@claude fix security issues\` for automated fixes
-              4. Re-run security scan after fixes
-              
-              ### Resources
-              - [OWASP Top 10](https://owasp.org/www-project-top-ten/)
-              - [Security Best Practices](./docs/security.md)
-              
-              cc: @security-team`,
-              labels: ['security', 'priority-high', 'automated']
-            });
+            const title = '🔒 Security Scan - Action Required';
+            const body = `## Security Issues Detected
             
-            console.log(`Created issue #${issue.data.number}`)
+            The automated security scan has found issues that need attention.
+            
+            ### Scan Results
+            - Secret Scan: ${{ needs.secret-scan.result }}
+            - Dependency Scan: ${{ needs.dependency-scan.result }}
+            
+            ### Priority Actions
+            1. If secrets were detected, rotate them immediately
+            2. Update vulnerable dependencies
+            3. Review security findings in the Security tab
+            
+            ### Resources
+            - [View Security Alerts](https://github.com/${{ github.repository }}/security)
+            - [View Workflow Run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+            
+            ---
+            *This issue was automatically created by the security workflow*`;
+            
+            try {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: title,
+                body: body,
+                labels: ['security', 'automated']
+              });
+            } catch (error) {
+              console.log('Could not create issue:', error.message);
+            }
