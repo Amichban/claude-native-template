@@ -248,13 +248,13 @@ jobs:
             p/react
             
       - name: Bandit (Python Security)
-        if: hashFiles('**/*.py') != ''
+        if: ${{ hashFiles('**/*.py') != '' }}
         run: |
           pip install bandit
           bandit -r . -f json -o bandit-results.json || true
           
       - name: ESLint Security Plugin
-        if: hashFiles('**/*.js', '**/*.ts', '**/*.jsx', '**/*.tsx') != ''
+        if: ${{ hashFiles('**/*.js', '**/*.ts', '**/*.jsx', '**/*.tsx') != '' }}
         run: |
           npm install -g eslint eslint-plugin-security
           eslint . --ext .js,.jsx,.ts,.tsx --format json --output-file eslint-security.json || true
